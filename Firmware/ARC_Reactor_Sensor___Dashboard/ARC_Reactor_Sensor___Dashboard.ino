@@ -23,20 +23,22 @@
 #include <WiFi.h>
 #include <esp_http_server.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
 #include <Wire.h>
 #include <Preferences.h>
 #include <math.h>
 
 // ---------------- settings ----------------
-// Home Wi-Fi lives in secrets.h (copy secrets.example.h, fill it in; it is git-ignored).
-// Without that file the board simply makes its own hotspot.
+// Home Wi-Fi and hotspot login live in secrets.h (copy secrets.example.h, fill it in; git-ignored).
+// Without that file the board makes its own hotspot with the default login below.
 #if __has_include("secrets.h")
-  #include "secrets.h"                 // defines WIFI_SSID and WIFI_PASS
+  #include "secrets.h"                 // defines WIFI_SSID, WIFI_PASS, AP_SSID, AP_PASS
 #else
   const char* WIFI_SSID = "";          // empty = make our own hotspot
   const char* WIFI_PASS = "";
+  const char* AP_SSID   = "ARC-Reactor-MK-I";
+  const char* AP_PASS   = "arc12345";  // minimum 8 characters
 #endif
-
 
 constexpr int   PIN_OUT = 3, PIN_LOP = 6, PIN_LON = 7;   // AD8232
 constexpr int   PIN_SDA = 4, PIN_SCL = 5;                // MPU6050
@@ -66,6 +68,7 @@ constexpr int BUF = 1024;
 int16_t buf[BUF];                      // filtered ECG, 0.1 mV-at-pin units
 volatile uint32_t head = 0;            // total ECG samples written
 volatile int  bpm = 0;
+volatile float fsMeas = 250.0f;        // measured ECG sample rate (Hz), shown on the dashboard
 volatile bool leadsOff = true;
 
 enum Pose : uint8_t { P_UNKNOWN, P_UPRIGHT, P_BACK, P_STOMACH, P_UPSIDE, P_SIDE, P_TILT };
@@ -147,18 +150,47 @@ struct Notch {
 } notch;
 
 // ---------------- ECG sampling + heart-rate task ----------------
+// median of 5: removes 1-2 sample spikes (Wi-Fi bursts, loose contact) but keeps the QRS shape
+static inline float med5(float a, float b, float c, float d, float e) {
+  float v[5] = {a, b, c, d, e};
+  for (int i = 1; i < 5; i++) {
+    float k = v[i]; int j = i - 1;
+    while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = k;
+  }
+  return v[2];
+}
+static uint32_t medianU(const uint32_t* a, uint32_t n) {   // n <= 7
+  uint32_t v[7];
+  for (uint32_t i = 0; i < n; i++) v[i] = a[i];
+  for (uint32_t i = 1; i < n; i++) {
+    uint32_t k = v[i]; int j = (int)i - 1;
+    while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = k;
+  }
+  return v[n / 2];
+}
+
 void sampler(void*) {
   TickType_t t = xTaskGetTickCount();
   bool primed = false, above = false;
-  float dc = 0, sm = 0, prev = 0, ie = 0, pk = 0;
-  uint32_t n = 0, lastBeat = 0, rr[5] = {0}, rn = 0, ri = 0;
+  float dc = 0, sm = 0, prev = 0, ie = 0, pk = 0, rw[5] = {0};
+  uint32_t n = 0, lastBeatN = 0, rr[7] = {0}, rn = 0, ri = 0, fsCount = 0;
+  uint64_t lastBeatUs = 0, fsT0 = esp_timer_get_time();
+  int wi = 0;
 
   for (;;) {
     vTaskDelayUntil(&t, pdMS_TO_TICKS(4));          // 4 ms = 250 Hz
 
+    if (++fsCount >= 250) {                         // measure the real sample rate
+      uint64_t nu = esp_timer_get_time();
+      fsMeas = 250.0f * 1e6f / (float)(nu - fsT0);
+      fsT0 = nu; fsCount = 0;
+    }
+
     if (digitalRead(PIN_LOP) || digitalRead(PIN_LON)) {   // electrode off
       leadsOff = true; bpm = 0; primed = false; above = false;
-      pk = ie = 0; lastBeat = 0; rn = ri = 0;
+      pk = ie = 0; lastBeatUs = 0; lastBeatN = 0; rn = ri = 0;
       buf[head % BUF] = 0; head = head + 1;
       continue;
     }
@@ -167,9 +199,14 @@ void sampler(void*) {
     uint32_t s = 0;
     for (int i = 0; i < 4; i++) s += analogReadMilliVolts(PIN_OUT);  // 4x average
     float x = s / 4.0f;                                              // mV at the pin
-    if (!primed) { notch.prime(x); dc = x; sm = prev = ie = 0; primed = true; }
+    if (!primed) {
+      for (int i = 0; i < 5; i++) rw[i] = x;
+      notch.prime(x); dc = x; sm = prev = ie = 0; primed = true;
+    }
+    rw[wi] = x; wi = (wi + 1) % 5;
+    float xm = med5(rw[0], rw[1], rw[2], rw[3], rw[4]);              // spike filter
 
-    float f  = notch.run(x);                 // remove mains hum
+    float f  = notch.run(xm);                // remove mains hum
     dc += (f - dc) * 0.005f;                 // slow baseline tracker
     float hp = f - dc;                       // baseline-free ECG
 
@@ -185,19 +222,28 @@ void sampler(void*) {
     pk = fmaxf(ie, pk * 0.998f);
     float th = fmaxf(0.4f * pk, 6.0f);
     if (ie < 0.5f * th) above = false;
-    if (!above && ie > th && n - lastBeat > 75) {       // 0.3 s refractory
+    if (!above && ie > th && n - lastBeatN > 75) {      // 0.3 s refractory
       above = true;
-      if (lastBeat) {
-        uint32_t dd = n - lastBeat;
-        if (dd <= 375) {                                // 40 bpm or faster
-          rr[ri] = dd; ri = (ri + 1) % 5; if (rn < 5) rn++;
-          float sum = 0; for (uint32_t i = 0; i < rn; i++) sum += rr[i];
-          bpm = (int)(60.0f * FS * rn / sum + 0.5f);
-        } else { rn = ri = 0; }
+      uint64_t nowUs = esp_timer_get_time();
+      if (!lastBeatUs) { lastBeatUs = nowUs; lastBeatN = n; }
+      else {
+        uint32_t dd = (uint32_t)(nowUs - lastBeatUs);   // microseconds since the last beat
+        if (rn >= 3 && dd < 0.6f * medianU(rr, rn)) {
+          // too early for this rhythm: a leftover spike or a T wave, not a new beat
+        } else {
+          if (dd <= 1500000) { rr[ri] = dd; ri = (ri + 1) % 7; if (rn < 7) rn++; }
+          else rn = ri = 0;                             // slower than 40 bpm: missed beat, start over
+          lastBeatUs = nowUs; lastBeatN = n;
+          if (rn >= 4) {                                // needs 4 intervals before showing a number
+            uint32_t m = medianU(rr, rn), lo = rr[0], hi = rr[0];
+            for (uint32_t i = 1; i < rn; i++) { if (rr[i] < lo) lo = rr[i]; if (rr[i] > hi) hi = rr[i]; }
+            // uneven rhythm = unreliable signal: show "--" instead of a wrong number
+            bpm = (hi - lo <= 0.4f * m) ? (int)(60e6f / m + 0.5f) : 0;
+          } else bpm = 0;
+        }
       }
-      lastBeat = n;
     }
-    if (lastBeat && n - lastBeat > 3 * (uint32_t)FS) { bpm = 0; rn = ri = 0; }
+    if (lastBeatUs && esp_timer_get_time() - lastBeatUs > 3000000) { bpm = 0; rn = ri = 0; }
   }
 }
 
@@ -342,6 +388,7 @@ details summary{cursor:pointer;color:var(--cy);font-size:12px;letter-spacing:.16
 <div class="kv"><span>PACKETS RECEIVED</span><b id="pk">0</b></div>
 <div class="kv"><span>ERRORS</span><b id="er">0</b></div>
 <div class="kv"><span>SIGNAL</span><b><span id="sig">--</span><span class="bars" id="bars"><i></i><i></i><i></i><i></i><i></i></span></b></div>
+<div class="kv"><span>ECG SAMPLE RATE</span><b id="fsr">--</b></div>
 <div class="kv"><span>DISPLAY DELAY</span><b id="delay">--</b></div></section>
 </div>
 <details class="panel"><summary>ORIENTATION SETUP (ONE TIME)</summary>
@@ -352,8 +399,8 @@ details summary{cursor:pointer;color:var(--cy);font-size:12px;letter-spacing:.16
 </main>
 <script>
 const $=id=>document.getElementById(id),cv=$('c'),g=cv.getContext('2d');
-const FSR=250,N=1250,TARGET=125;
-let q=[],disp=[],seq=0,playing=false,acc=0,lastT=0,lo=-100,hi=100,ok=0,err=0,lastOk=0,dpr=1;
+const N=1250,TARGET=125;
+let FSR=250,q=[],disp=[],seq=0,playing=false,acc=0,lastT=0,lo=-100,hi=100,ok=0,err=0,lastOk=0,dpr=1;
 function fit(){dpr=devicePixelRatio||1;cv.width=Math.round(cv.clientWidth*dpr);cv.height=Math.round(cv.clientHeight*dpr)}
 addEventListener('resize',fit);fit();
 function draw(){
@@ -389,6 +436,7 @@ const POSE=['DETECTING','UPRIGHT','LYING ON BACK','LYING ON STOMACH','UPSIDE DOW
 const ANG=[0,0,90,90,180,90,0];
 function axis(id,v){const a=Math.min(1,Math.abs(v)),i=$('b'+id);i.style.left=(v>=0?50:50-a*50)+'%';i.style.width=(a*50)+'%';$('v'+id).textContent=v.toFixed(2)}
 function ui(j){
+  if(j.fs>100&&j.fs<400)FSR=j.fs;
   $('bpm').textContent=j.bpm>0?j.bpm:'--';
   $('cLeads').textContent=j.off?'LEADS OFF':'LEADS OK';$('cLeads').className='chip'+(j.off?' warn':'');
   $('cLink').textContent=j.rssi?'WI-FI '+j.rssi+' dBm':'HOTSPOT';
@@ -421,7 +469,7 @@ setInterval(()=>{
   const on=performance.now()-lastOk<2000;
   $('sys').className='sys'+(on?'':' off');
   $('systxt').textContent=on?'SYSTEM ONLINE':(ok?'SYSTEM OFFLINE':'CONNECTING');
-  $('pk').textContent=ok;$('er').textContent=err;$('delay').textContent=Math.round(q.length*1000/FSR)+' ms';
+  $('pk').textContent=ok;$('er').textContent=err;$('delay').textContent=Math.round(q.length*1000/FSR)+' ms';$('fsr').textContent=Math.round(FSR)+' Hz';
 },300);
 function cmd(c){return fetch('/cmd?c='+c)}
 function cal(c,msg){let n=5;const iv=setInterval(()=>{
@@ -456,6 +504,7 @@ static esp_err_t hData(httpd_req_t* req) {
   j.reserve(1500);
   j += "{\"seq\":";   j += (unsigned long)(from + cnt);
   j += ",\"bpm\":";   j += (int)bpm;
+  j += ",\"fs\":";    j += (int)lroundf((float)fsMeas);
   j += ",\"off\":";   j += leadsOff ? 1 : 0;
   j += ",\"imu\":";   j += imuOk ? 1 : 0;
   j += ",\"steps\":"; j += (unsigned long)steps;
@@ -535,7 +584,7 @@ void startWifi() {
       Serial.printf("  %s  (%d dBm, ch %d)\n", WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i), (int)WiFi.channel(i));
     Serial.println("Starting hotspot instead");
   }
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_SSID[0] ? WIFI_AP_STA : WIFI_AP);   // hotspot stays up while loop() keeps retrying home Wi-Fi
   WiFi.softAP(AP_SSID, AP_PASS);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.setSleep(false);
@@ -578,7 +627,7 @@ void waitForSecondTap() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_TOUCH, INPUT);
+  pinMode(PIN_TOUCH, INPUT_PULLDOWN);            // no phantom taps if the pad is not wired yet
   LED_SET(0, 0, 0);                              // pixel off
 
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) waitForSecondTap();
@@ -613,5 +662,19 @@ void loop() {
     else lastTap = now;
   }
   wasDown = down;
+
+  // Keep trying the home Wi-Fi in the background (the router may boot slower than the board).
+  // Only while nobody is on our hotspot, so the dashboard does not stutter.
+  static uint32_t lastTry = 0;
+  if (WIFI_SSID[0] && WiFi.status() != WL_CONNECTED && now - lastTry > 20000 &&
+      WiFi.softAPgetStationNum() == 0) {
+    lastTry = now;
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+  static bool wasUp = (WiFi.status() == WL_CONNECTED);
+  bool up = (WiFi.status() == WL_CONNECTED);
+  if (up && !wasUp) Serial.printf("Home Wi-Fi joined: http://%s\n", WiFi.localIP().toString().c_str());
+  wasUp = up;
+
   delay(5);
 }
